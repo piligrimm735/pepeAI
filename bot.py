@@ -6,8 +6,8 @@ from dotenv import load_dotenv
 # Загружаем переменные из .env
 load_dotenv()
 
-BOT_TOKEN = os.getenv("8791536646:AAESrE6-5t3HZFUee5T6qtcwFN0neESStYw")
-GEMINI_API_KEY = os.getenv("AIzaSyBELsa-RoCF3lmqR6czBtp2rM0lBwPfex0")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not BOT_TOKEN or not GEMINI_API_KEY:
     raise ValueError("BOT_TOKEN или GEMINI_API_KEY не заданы в .env файле")
