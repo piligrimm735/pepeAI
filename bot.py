@@ -7,80 +7,44 @@ import json
 import time
 import sys
 import os
+import uuid
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
 
-# ========== ЗАГРУЗКА .env ==========
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MODEL = os.getenv("MODEL", "gpt-3.5-turbo")
 
-# Проверка токена
-if not BOT_TOKEN or BOT_TOKEN == "вставь_свой_токен_сюда":
-    print("=" * 60)
-    print("❌ ОШИБКА: Токен не найден в .env файле!")
-    print("=" * 60)
-    print("📝 Создай файл .env и вставь токен:")
-    print()
-    print("BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz")
-    print("MODEL=gpt-3.5-turbo")
-    print()
-    print("=" * 60)
+if not BOT_TOKEN:
+    print("❌ BOT_TOKEN не найден в .env!")
     sys.exit(1)
 
-# ========== ЛОГИ ==========
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ========== КЭШ VQD ТОКЕНА ==========
-vqd_cache = {"token": None, "expires": 0}
+# ========== НОВЫЙ МЕТОД С ПОЛНЫМИ ЗАГОЛОВКАМИ ==========
 
-def get_vqd_token(session):
-    """Получает VQD токен для DuckDuckGo AI"""
-    global vqd_cache
+def ask_duckduckgo(message):
+    """Исправленный запрос к DuckDuckGo AI"""
     
-    if vqd_cache["token"] and time.time() < vqd_cache["expires"]:
-        return vqd_cache["token"]
+    session = requests.Session()
     
-    url = "https://duckduckgo.com/duckchat/v1/status"
+    # Генерируем уникальный ID сессии
+    x_vqd_4 = str(uuid.uuid4()).replace('-', '')[:16]
+    
+    # Заголовки как у браузера
     headers = {
-        "x-vqd-accept": "1",
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-    }
-    
-    try:
-        resp = session.get(url, headers=headers, timeout=10)
-        token = resp.headers.get("x-vqd-4", "")
-        
-        if token:
-            vqd_cache["token"] = token
-            vqd_cache["expires"] = time.time() + 3500
-            logger.info("✅ VQD токен получен")
-            return token
-        return None
-    except Exception as e:
-        logger.error(f"❌ Ошибка VQD: {e}")
-        return None
-
-def ask_duckduckgo(message, session):
-    """Запрос к DuckDuckGo AI"""
-    vqd = get_vqd_token(session)
-    if not vqd:
-        return "🚫 DuckDuckGo AI недоступен"
-    
-    url = "https://duckduckgo.com/duckchat/v1/chat"
-    headers = {
-        "x-vqd-4": vqd,
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
         "Accept": "text/event-stream",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Content-Type": "application/json",
         "Origin": "https://duckduckgo.com",
-        "Referer": "https://duckduckgo.com/"
+        "Pragma": "no-cache",
+        "Referer": "https://duckduckgo.com/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "x-vqd-4": x_vqd_4
     }
     
     payload = {
@@ -89,11 +53,26 @@ def ask_duckduckgo(message, session):
     }
     
     try:
-        resp = session.post(url, headers=headers, json=payload, stream=True, timeout=45)
+        # Сначала получаем статус для получения реального VQD токена
+        status_url = "https://duckduckgo.com/duckchat/v1/status"
+        status_resp = session.get(status_url, headers={"x-vqd-accept": "1", "User-Agent": headers["User-Agent"]})
         
-        if resp.status_code != 200:
-            return f"⚠️ Ошибка {resp.status_code}"
+        if "x-vqd-4" in status_resp.headers:
+            headers["x-vqd-4"] = status_resp.headers["x-vqd-4"]
+            logger.info(f"✅ VQD получен: {headers['x-vqd-4'][:10]}...")
         
+        # Отправляем сообщение
+        chat_url = "https://duckduckgo.com/duckchat/v1/chat"
+        resp = session.post(chat_url, headers=headers, json=payload, timeout=30, stream=True)
+        
+        if resp.status_code == 403:
+            logger.error("❌ DuckDuckGo заблокировал IP")
+            return None
+        elif resp.status_code != 200:
+            logger.error(f"❌ HTTP {resp.status_code}")
+            return None
+        
+        # Собираем ответ
         full_response = ""
         for line in resp.iter_lines(decode_unicode=True):
             if line and line.startswith("data: "):
@@ -104,16 +83,74 @@ def ask_duckduckgo(message, session):
                 except:
                     continue
         
-        return full_response.strip() or "🤖 Нет ответа"
+        return full_response.strip() if full_response else None
         
     except Exception as e:
-        return f"💥 Ошибка: {str(e)[:100]}"
+        logger.error(f"❌ DuckDuckGo ошибка: {e}")
+        return None
 
-# ========== ОБРАБОТЧИКИ ==========
+# ========== РЕЗЕРВНЫЙ ПРОВАЙДЕР: BlackBox AI ==========
+
+def ask_blackbox(message):
+    """Резервный провайдер - BlackBox AI"""
+    try:
+        url = "https://api.blackbox.ai/api/chat"
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0"
+        }
+        payload = {
+            "messages": [{"role": "user", "content": message}],
+            "model": "blackboxai"
+        }
+        
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
+        
+        if resp.status_code == 200:
+            return resp.text.strip()
+        return None
+    except:
+        return None
+
+# ========== РЕЗЕРВНЫЙ ПРОВАЙДЕР 2: Cloudflare AI ==========
+
+def ask_cloudflare(message):
+    """Cloudflare Workers AI (нужен свой воркер)"""
+    try:
+        # Замени на свой URL если есть
+        url = "https://llama3.yourname.workers.dev"
+        resp = requests.get(f"{url}?q={requests.utils.quote(message)}", timeout=30)
+        if resp.status_code == 200:
+            return resp.text.strip()
+        return None
+    except:
+        return None
+
+# ========== ОСНОВНАЯ ФУНКЦИЯ С ФОЛЛБЭКОМ ==========
+
+def get_ai_response(message):
+    """Пробуем разные провайдеры"""
+    
+    # 1. Пробуем DuckDuckGo
+    logger.info("🦆 Пробую DuckDuckGo...")
+    response = ask_duckduckgo(message)
+    if response:
+        return response
+    
+    # 2. Пробуем BlackBox
+    logger.info("📦 Пробую BlackBox AI...")
+    response = ask_blackbox(message)
+    if response:
+        return response + "\n\n_(через BlackBox AI)_"
+    
+    # 3. Заглушка если всё упало
+    return "❌ Все AI провайдеры недоступны. Попробуй позже."
+
+# ========== ОБРАБОТЧИКИ TELEGRAM ==========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"🦆 Бот с DuckDuckGo AI\n"
+        f"🤖 AI Бот\n"
         f"🧠 Модель: {MODEL}\n"
         f"🔒 Без API ключей\n\n"
         f"Просто напиши вопрос!\n"
@@ -121,6 +158,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global MODEL
     models = """
 📋 *Модели:*
 • `gpt-3.5-turbo` — OpenAI
@@ -129,11 +167,13 @@ async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • `mixtral-8x7b` — Mistral
 
 Смена: `model:название`
+Текущая: `{MODEL}`
 """
-    await update.message.reply_text(models, parse_mode="Markdown")
+    await update.message.reply_text(models.format(MODEL=MODEL), parse_mode="Markdown")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
+    user_id = update.effective_user.id
     
     # Смена модели
     if user_text.lower().startswith("model:"):
@@ -148,15 +188,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Доступны: {', '.join(valid)}")
         return
     
+    # Отправляем "печатает"
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     
-    session = requests.Session()
-    response = ask_duckduckgo(user_text, session)
+    logger.info(f"📨 [{user_id}] {user_text[:50]}...")
     
+    # Получаем ответ
+    response = get_ai_response(user_text)
+    
+    logger.info(f"📤 [{user_id}] Ответ: {len(response)} символов")
+    
+    # Отправляем
     if len(response) > 4000:
         for i in range(0, len(response), 4000):
             await update.message.reply_text(response[i:i+4000])
-            time.sleep(0.5)
+            time.sleep(0.3)
     else:
         await update.message.reply_text(response)
 
@@ -164,8 +210,9 @@ async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Ошибка: {context.error}")
 
 def main():
-    print(f"🚀 Бот запускается...")
+    print(f"🚀 Бот запущен")
     print(f"🧠 Модель: {MODEL}")
+    print(f"📡 Провайдеры: DuckDuckGo + BlackBox (фоллбэк)")
     
     app = Application.builder().token(BOT_TOKEN).build()
     
@@ -174,7 +221,6 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error)
     
-    print("✅ Бот работает!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
