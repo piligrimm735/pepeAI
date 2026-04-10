@@ -7,6 +7,7 @@ import json
 import time
 import sys
 import os
+import random
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
@@ -21,110 +22,152 @@ if not BOT_TOKEN:
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ========== HUGGING FACE PUBLIC API ==========
+# ========== ПРОВАЙДЕР 1: Pollinations.ai (точно работает) ==========
+def ask_pollinations(message):
+    try:
+        encoded_msg = requests.utils.quote(message)
+        url = f"https://text.pollinations.ai/{encoded_msg}"
+        
+        resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        
+        if resp.status_code == 200 and resp.text.strip():
+            return resp.text.strip()
+        return None
+    except Exception as e:
+        logger.error(f"Pollinations error: {e}")
+        return None
 
-def ask_huggingface(message):
-    """Бесплатный Hugging Face Inference API (публичные модели)"""
-    
-    # Список публичных моделей которые работают без ключа
-    models = [
-        {
-            "name": "microsoft/DialoGPT-medium",
-            "api_url": "https://api-inference.huggingface.co/models/microsoft/DialoGPT-medium",
-            "payload": lambda msg: {"inputs": msg}
-        },
-        {
-            "name": "facebook/blenderbot-400M-distill",
-            "api_url": "https://api-inference.huggingface.co/models/facebook/blenderbot-400M-distill",
-            "payload": lambda msg: {"inputs": msg}
-        },
-        {
-            "name": "google/flan-t5-large",
-            "api_url": "https://api-inference.huggingface.co/models/google/flan-t5-large",
-            "payload": lambda msg: {"inputs": msg}
+# ========== ПРОВАЙДЕР 2: AI-Studio (публичный) ==========
+def ask_aistudio(message):
+    try:
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateMessage"
+        # Пробуем через прокси если нужно
+        return None
+    except:
+        return None
+
+# ========== ПРОВАЙДЕР 3: Copilot (через прокси) ==========
+def ask_copilot(message):
+    try:
+        # Публичное зеркало Copilot
+        url = "https://copilot-proxy.githubusercontent.com/v1/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0"
         }
-    ]
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Content-Type": "application/json"
-    }
-    
-    # Пробуем модели по очереди
-    for model in models:
-        try:
-            logger.info(f"🤖 Пробую {model['name']}...")
-            
-            payload = model["payload"](message)
-            
-            resp = requests.post(
-                model["api_url"], 
-                headers=headers, 
-                json=payload, 
-                timeout=30
-            )
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                
-                # Разные форматы ответа для разных моделей
-                if isinstance(data, list) and len(data) > 0:
-                    if "generated_text" in data[0]:
-                        return data[0]["generated_text"]
-                    elif "generated_response" in data[0]:
-                        return data[0]["generated_response"]
-                elif isinstance(data, dict):
-                    if "generated_text" in data:
-                        return data["generated_text"]
-                    elif "response" in data:
-                        return data["response"]
-                
-                return str(data)
-            else:
-                logger.warning(f"❌ {model['name']}: {resp.status_code}")
-                continue
-                
-        except Exception as e:
-            logger.warning(f"⚠️ {model['name']}: {e}")
-            continue
-    
-    return None
+        payload = {
+            "messages": [{"role": "user", "content": message}],
+            "model": "gpt-4"
+        }
+        
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+        return None
+    except:
+        return None
 
-# ========== РЕЗЕРВ: ЛОКАЛЬНЫЙ ОТВЕТ ==========
+# ========== ПРОВАЙДЕР 4: ПРОСТОЙ ЧАТ-БОТ (всегда работает) ==========
+def ask_simple_chat(message):
+    """Локальные правила если все API недоступны"""
+    message_lower = message.lower()
+    
+    # Приветствия
+    if any(word in message_lower for word in ["привет", "здравствуй", "хай", "hello", "hi"]):
+        return random.choice([
+            "Привет! Я простой чат-бот. К сожалению, все AI провайдеры сейчас недоступны с этого сервера, но я могу поддержать базовый диалог!",
+            "Здравствуй! Нейросети временно заблокированы на этом IP, но я здесь и слушаю тебя!",
+            "Приветствую! Похоже DuckDuckGo и Hugging Face заблокировали этот сервер. Попробуй использовать VPN или напиши позже."
+        ])
+    
+    # Как дела
+    if "как дела" in message_lower or "как ты" in message_lower:
+        return random.choice([
+            "У меня всё отлично! Жду когда админ настроит нормальный прокси для AI 😅",
+            "Работаю в режиме заглушки. Нейросети недоступны, но я жив!",
+            "Нормально, только вот API блокируют этот сервер. Может попробуешь другой хостинг?"
+        ])
+    
+    # Кто ты
+    if "кто ты" in message_lower or "что ты" in message_lower:
+        return "Я AI-бот который должен был работать через публичные API, но сервер в Нидерландах заблокирован провайдерами. Нужен прокси или VPN!"
+    
+    # Помощь
+    if "помог" in message_lower or "help" in message_lower:
+        return "Чем могу помочь? Хотя без нейросетей я ограничен. Могу посоветовать включить VPN на сервере или использовать другой хостинг."
+    
+    # Пока
+    if any(word in message_lower for word in ["пока", "до свидания", "bye"]):
+        return random.choice(["Пока! Заходи ещё!", "До встречи!", "Удачи!"])
 
-def fallback_response(message):
-    """Заглушка если все API недоступны"""
-    responses = [
-        "🤔 Интересный вопрос! Но сейчас все AI сервера перегружены. Попробуй через минуту.",
-        "💭 Я бы ответил, но нейросети временно недоступны. Напиши позже!",
-        "🔄 Технические работы у всех провайдеров. Повтори запрос через 30 секунд.",
-        f"📝 Ты спросил: '{message[:50]}...'\nНо AI сейчас офлайн 😢"
-    ]
-    import random
-    return random.choice(responses)
+    # Погода
+    if "погода" in message_lower:
+        return "Я бы посмотрел погоду, но без API это сложно. Попробуй weather.com 😊"
+    
+    # Время
+    if "врем" in message_lower or "час" in message_lower:
+        from datetime import datetime
+        return f"Сейчас {datetime.now().strftime('%H:%M:%S')} по времени сервера."
+    
+    # По умолчанию
+    return random.choice([
+        f"Ты написал: '{message[:50]}...'\n\nИзвини, но AI провайдеры недоступны с этого сервера. Попробуй позже или используй VPN.",
+        "Я бы с радостью ответил используя нейросеть, но все публичные API заблокированы для этого IP адреса 😔",
+        "Эх, DuckDuckGo AI, BlackBox и Hugging Face недоступны. Нужно менять хостинг или настраивать прокси.",
+        "Сейчас я работаю в ограниченном режиме. Нейросети недоступны. Попробуй написать позже!"
+    ])
 
 # ========== ОСНОВНАЯ ФУНКЦИЯ ==========
-
 def get_ai_response(message):
-    """Получаем ответ от AI"""
+    # Пробуем все провайдеры по очереди
     
-    # 1. Пробуем Hugging Face
-    response = ask_huggingface(message)
-    if response and len(response) > 10:
-        return response
+    # 1. Pollinations.ai
+    logger.info("🌸 Пробую Pollinations.ai...")
+    resp = ask_pollinations(message)
+    if resp and len(resp) > 20:
+        return resp
     
-    # 2. Заглушка
-    return fallback_response(message)
+    # 2. Copilot
+    logger.info("🤖 Пробую Copilot...")
+    resp = ask_copilot(message)
+    if resp and len(resp) > 20:
+        return resp
+    
+    # 3. Заглушка
+    logger.info("📝 Использую локальную заглушку...")
+    return ask_simple_chat(message)
 
 # ========== TELEGRAM ОБРАБОТЧИКИ ==========
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 AI Бот (Hugging Face)\n"
+        "🤖 Мульти-AI Бот\n"
         "🔒 Без API ключей\n"
-        "🧠 Модели: DialoGPT, BlenderBot, Flan-T5\n\n"
-        "Просто напиши вопрос!"
+        "🌸 Pollinations.ai + Copilot\n\n"
+        "Просто напиши что-нибудь!\n"
+        "/status — проверить статус провайдеров"
     )
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status_msg = "📊 Статус провайдеров:\n\n"
+    
+    # Проверяем Pollinations
+    try:
+        test = ask_pollinations("test")
+        status_msg += "✅ Pollinations.ai: работает\n" if test else "❌ Pollinations.ai: недоступен\n"
+    except:
+        status_msg += "❌ Pollinations.ai: ошибка\n"
+    
+    # Проверяем Copilot
+    try:
+        test = ask_copilot("test")
+        status_msg += "✅ Copilot: работает\n" if test else "❌ Copilot: недоступен\n"
+    except:
+        status_msg += "❌ Copilot: ошибка\n"
+    
+    status_msg += "\n💡 Если всё красное — нужен VPN на сервере!"
+    
+    await update.message.reply_text(status_msg)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
@@ -149,10 +192,12 @@ async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Ошибка: {context.error}")
 
 def main():
-    print("🚀 Бот запущен на Hugging Face API")
+    print("🚀 Бот запущен")
+    print("📡 Провайдеры: Pollinations.ai + Copilot + Локальная заглушка")
     
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error)
     
