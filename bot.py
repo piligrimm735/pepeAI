@@ -1,321 +1,323 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
-import logging
-import time
-import sys
-import os
-import subprocess
+import telebot
+import sqlite3
 import requests
-import tarfile
-import shutil
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from dotenv import load_dotenv
+import json
+import io
+import os
+from datetime import datetime
+import time
 
-load_dotenv()
+# ===== НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ =====
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-MODEL = os.getenv("MODEL", "tinyllama")
 
-if not BOT_TOKEN:
-    print("❌ BOT_TOKEN не найден в .env!")
-    sys.exit(1)
+# ===== БАЗА ДАННЫХ =====
+conn = sqlite3.connect('bot.db', check_same_thread=False)
+cursor = conn.cursor()
 
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        balance INTEGER DEFAULT 0,
+        whitelist INTEGER DEFAULT 0,
+        total_used INTEGER DEFAULT 0
+    )
+''')
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        stars INTEGER,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+''')
+conn.commit()
 
-# ========== АВТОУСТАНОВКА OLLAMA ==========
+# ===== БОТ =====
+bot = telebot.TeleBot(BOT_TOKEN)
 
-def check_ollama():
-    """Проверяет установлена ли Ollama"""
+# ===== БЕСПЛАТНЫЕ НЕЙРОСЕТИ =====
+def ai_text(prompt):
+    """Бесплатная текстовая нейросеть через OpenRouter"""
     try:
-        result = subprocess.run(["ollama", "--version"], capture_output=True, text=True)
-        return result.returncode == 0
-    except FileNotFoundError:
-        return False
-
-def install_ollama():
-    """Автоматическая установка Ollama"""
-    print("📦 Ollama не найдена. Начинаю установку...")
-    
-    try:
-        # Создаём временную папку
-        temp_dir = "/tmp/ollama_install"
-        os.makedirs(temp_dir, exist_ok=True)
-        os.chdir(temp_dir)
-        
-        # Определяем архитектуру
-        arch = subprocess.check_output(["uname", "-m"]).decode().strip()
-        if arch == "x86_64":
-            ollama_url = "https://github.com/ollama/ollama/releases/download/v0.4.7/ollama-linux-amd64.tgz"
-        elif arch == "aarch64":
-            ollama_url = "https://github.com/ollama/ollama/releases/download/v0.4.7/ollama-linux-arm64.tgz"
-        else:
-            print(f"❌ Неподдерживаемая архитектура: {arch}")
-            return False
-        
-        print(f"📥 Скачиваю Ollama с {ollama_url}...")
-        
-        # Скачиваем
-        response = requests.get(ollama_url, stream=True)
-        with open("ollama.tgz", "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        
-        print("📦 Распаковываю...")
-        
-        # Распаковываем
-        with tarfile.open("ollama.tgz", "r:gz") as tar:
-            tar.extractall()
-        
-        # Копируем в систему
-        shutil.copy("ollama", "/usr/local/bin/ollama")
-        os.chmod("/usr/local/bin/ollama", 0o755)
-        
-        # Создаём systemd сервис
-        service_content = """[Unit]
-Description=Ollama Service
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/local/bin/ollama serve
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-"""
-        with open("/etc/systemd/system/ollama.service", "w") as f:
-            f.write(service_content)
-        
-        # Запускаем
-        subprocess.run(["systemctl", "daemon-reload"])
-        subprocess.run(["systemctl", "enable", "ollama"])
-        subprocess.run(["systemctl", "start", "ollama"])
-        
-        # Ждём запуска
-        time.sleep(3)
-        
-        print("✅ Ollama установлена и запущена!")
-        return True
-        
-    except Exception as e:
-        print(f"❌ Ошибка установки Ollama: {e}")
-        return False
-    
-    finally:
-        # Чистим
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        os.chdir("/")
-
-def check_and_pull_model(model_name):
-    """Проверяет и скачивает модель если нужно"""
-    try:
-        # Проверяем есть ли модель
-        result = subprocess.run(["ollama", "list"], capture_output=True, text=True)
-        
-        if model_name not in result.stdout:
-            print(f"📥 Скачиваю модель {model_name}...")
-            print("Это может занять несколько минут...")
-            
-            subprocess.run(["ollama", "pull", model_name], check=True)
-            print(f"✅ Модель {model_name} готова!")
-        else:
-            print(f"✅ Модель {model_name} уже есть")
-        
-        return True
-    except Exception as e:
-        print(f"❌ Ошибка загрузки модели: {e}")
-        return False
-
-def init_ollama():
-    """Инициализация Ollama"""
-    print("🔧 Проверяю Ollama...")
-    
-    # Проверяем и устанавливаем Ollama
-    if not check_ollama():
-        print("⚠️ Ollama не установлена")
-        if not install_ollama():
-            return False
-    
-    # Проверяем и скачиваем модель
-    if not check_and_pull_model(MODEL):
-        return False
-    
-    return True
-
-# ========== РАБОТА С OLLAMA ==========
-
-def ask_ollama(message):
-    """Запрос к Ollama"""
-    try:
-        import ollama
-        
-        messages = [
-            {
-                "role": "system",
-                "content": "Ты полезный ассистент. Отвечай на русском языке кратко и по делу."
+        response = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": "Bearer sk-or-v1-бесплатный_ключ_openrouter",
+                "Content-Type": "application/json"
             },
-            {
-                "role": "user",
-                "content": message
-            }
-        ]
-        
-        response = ollama.chat(
-            model=MODEL,
-            messages=messages,
-            options={
+            json={
+                "model": "mistralai/mistral-7b-instruct:free",
+                "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.7,
                 "max_tokens": 500
-            }
+            },
+            timeout=30
         )
-        
-        return response["message"]["content"].strip()
-        
-    except ImportError:
-        return "❌ Установи ollama-python: pip install ollama"
-    except Exception as e:
-        logger.error(f"Ollama error: {e}")
-        return f"❌ Ошибка Ollama: {str(e)[:100]}"
-
-def get_available_models():
-    """Список доступных моделей"""
-    try:
-        import ollama
-        models = ollama.list()
-        return [m["name"] for m in models["models"]]
+        return response.json()['choices'][0]['message']['content']
     except:
-        return []
+        return "⚠️ Ошибка нейросети. Попробуйте позже."
 
-# ========== TELEGRAM ОБРАБОТЧИКИ ==========
+def ai_image(prompt):
+    """Бесплатная генерация картинок через Hugging Face"""
+    try:
+        API_URL = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
+        headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+        
+        response = requests.post(API_URL, headers=headers, json={"inputs": prompt}, timeout=45)
+        
+        if response.status_code == 200:
+            return response.content
+        else:
+            # Запасная бесплатная модель
+            API_URL = "https://api-inference.huggingface.co/models/runwayml/stable-diffusion-v1-5"
+            response = requests.post(API_URL, headers=headers, json={"inputs": prompt})
+            return response.content
+    except:
+        return None
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    models = get_available_models()
-    models_str = ", ".join(models[:5]) if models else "нет"
-    
-    await update.message.reply_text(
-        f"🦙 Ollama AI Бот\n"
-        f"🧠 Модель: {MODEL}\n"
-        f"📦 Доступные модели: {models_str}\n"
-        f"💾 Локально на сервере\n\n"
-        f"Просто напиши вопрос!\n"
-        f"/pull модель — скачать новую модель\n"
-        f"/models — список моделей\n"
-        f"/switch модель — сменить модель"
+# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
+def get_user(user_id, username=None):
+    cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+    user = cursor.fetchone()
+    if not user and username:
+        cursor.execute('INSERT INTO users (user_id, username) VALUES (?, ?)', (user_id, username))
+        conn.commit()
+        return (user_id, username, 0, 0, 0)
+    return user
+
+def has_access(user_id):
+    user = get_user(user_id)
+    return user[3] == 1 or user[2] > 0  # whitelist или есть баланс
+
+def use_credit(user_id):
+    user = get_user(user_id)
+    if user[3] == 1:  # whitelist - безлимит
+        cursor.execute('UPDATE users SET total_used = total_used + 1 WHERE user_id = ?', (user_id,))
+        conn.commit()
+        return True
+    elif user[2] > 0:  # есть баланс
+        cursor.execute('UPDATE users SET balance = balance - 1, total_used = total_used + 1 WHERE user_id = ?', (user_id,))
+        conn.commit()
+        return True
+    return False
+
+# ===== КОМАНДЫ БОТА =====
+@bot.message_handler(commands=['start'])
+def start(message):
+    user = get_user(message.from_user.id, message.from_user.username)
+    bot.reply_to(message, 
+        f"🤖 *AI Бот*\n\n"
+        f"💰 Баланс: {user[2]} запросов\n"
+        f"🔓 Whitelist: {'✅ Да' if user[3] else '❌ Нет'}\n\n"
+        f"📝 Команды:\n"
+        f"/buy - купить запросы\n"
+        f"/img описание - создать картинку\n"
+        f"/ask вопрос - задать вопрос\n"
+        f"/balance - проверить баланс\n\n"
+        f"Просто отправь текст для ответа нейросети!",
+        parse_mode='Markdown'
     )
 
-async def pull_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(
-            "📥 Укажи модель для скачивания:\n"
-            "`/pull tinyllama`\n"
-            "`/pull llama3.2:1b`\n"
-            "`/pull gemma2:2b`",
-            parse_mode="Markdown"
-        )
-        return
-    
-    model = context.args[0]
-    msg = await update.message.reply_text(f"📥 Скачиваю {model}... Это займёт пару минут.")
-    
-    try:
-        subprocess.run(["ollama", "pull", model], check=True, timeout=300)
-        await msg.edit_text(f"✅ Модель {model} установлена!")
-    except subprocess.TimeoutExpired:
-        await msg.edit_text(f"⏰ Скачивание {model} занимает больше 5 минут. Проверь вручную.")
-    except Exception as e:
-        await msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+@bot.message_handler(commands=['balance'])
+def balance(message):
+    user = get_user(message.from_user.id)
+    bot.reply_to(message, f"💰 Ваш баланс: *{user[2]}* запросов\n🔓 Whitelist: {'✅' if user[3] else '❌'}", parse_mode='Markdown')
 
-async def models_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    models = get_available_models()
+@bot.message_handler(commands=['buy'])
+def buy(message):
+    prices = [
+        telebot.types.LabeledPrice("10 запросов к AI", 10),
+        telebot.types.LabeledPrice("50 запросов к AI", 50),
+        telebot.types.LabeledPrice("100 запросов к AI", 100)
+    ]
     
-    if not models:
-        await update.message.reply_text("📦 Нет установленных моделей. Скачай: `/pull tinyllama`", parse_mode="Markdown")
-        return
-    
-    msg = "📦 *Установленные модели:*\n\n"
-    for m in models[:10]:
-        msg += f"• `{m}`\n"
-    
-    msg += "\nСменить: `/switch название`"
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    bot.send_invoice(
+        chat_id=message.chat.id,
+        title="🎯 AI Запросы",
+        description="Покупка запросов к нейросети",
+        invoice_payload="ai_requests_purchase",
+        provider_token="",
+        currency="XTR",
+        prices=prices,
+        start_parameter="buy_ai_requests"
+    )
 
-async def switch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global MODEL
+@bot.pre_checkout_query_handler(func=lambda query: True)
+def checkout(pre_checkout_query):
+    bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+@bot.message_handler(content_types=['successful_payment'])
+def successful_payment(message):
+    user_id = message.from_user.id
+    amount = message.successful_payment.total_amount
     
-    if not context.args:
-        await update.message.reply_text("Укажи модель: `/switch llama3.2:1b`", parse_mode="Markdown")
+    requests_map = {10: 10, 50: 50, 100: 100}
+    requests_to_add = requests_map.get(amount, amount)
+    
+    cursor.execute('UPDATE users SET balance = balance + ? WHERE user_id = ?', (requests_to_add, user_id))
+    cursor.execute('INSERT INTO payments (user_id, stars) VALUES (?, ?)', (user_id, amount))
+    conn.commit()
+    
+    bot.reply_to(message, f"✅ Оплата успешна! Добавлено {requests_to_add} запросов!")
+
+@bot.message_handler(commands=['whitelist'])
+def whitelist(message):
+    if message.from_user.id != ADMIN_ID:
         return
     
-    new_model = context.args[0]
-    models = get_available_models()
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "❌ Использование: /whitelist @username")
+        return
     
-    if new_model in models:
-        MODEL = new_model
-        await update.message.reply_text(f"✅ Модель изменена на `{MODEL}`", parse_mode="Markdown")
+    username = args[1].replace('@', '')
+    cursor.execute('SELECT * FROM users WHERE username = ?', (username,))
+    user = cursor.fetchone()
+    
+    if user:
+        cursor.execute('UPDATE users SET whitelist = 1 WHERE user_id = ?', (user[0],))
+        conn.commit()
+        bot.reply_to(message, f"✅ @{username} добавлен в whitelist (безлимит)")
     else:
-        await update.message.reply_text(
-            f"❌ Модель `{new_model}` не найдена.\n"
-            f"Скачай: `/pull {new_model}`",
-            parse_mode="Markdown"
-        )
+        bot.reply_to(message, f"❌ Пользователь @{username} не найден")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
+@bot.message_handler(commands=['unwhitelist'])
+def unwhitelist(message):
+    if message.from_user.id != ADMIN_ID:
+        return
     
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "❌ Использование: /unwhitelist @username")
+        return
     
-    response = ask_ollama(user_text)
+    username = args[1].replace('@', '')
+    cursor.execute('UPDATE users SET whitelist = 0 WHERE username = ?', (username,))
+    conn.commit()
+    bot.reply_to(message, f"✅ @{username} удален из whitelist")
+
+@bot.message_handler(commands=['add'])
+def add_credits(message):
+    if message.from_user.id != ADMIN_ID:
+        return
     
-    if len(response) > 4000:
-        for i in range(0, len(response), 4000):
-            await update.message.reply_text(response[i:i+4000])
-            time.sleep(0.3)
+    args = message.text.split()
+    if len(args) < 3:
+        bot.reply_to(message, "❌ Использование: /add @username 100")
+        return
+    
+    username = args[1].replace('@', '')
+    amount = int(args[2])
+    
+    cursor.execute('UPDATE users SET balance = balance + ? WHERE username = ?', (amount, username))
+    conn.commit()
+    bot.reply_to(message, f"✅ Добавлено {amount} запросов для @{username}")
+
+@bot.message_handler(commands=['stats'])
+def stats(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    cursor.execute('SELECT COUNT(*), SUM(balance), SUM(total_used) FROM users')
+    total_users, total_balance, total_used = cursor.fetchone()
+    
+    cursor.execute('SELECT COUNT(*) FROM users WHERE whitelist = 1')
+    whitelist_count = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT SUM(stars) FROM payments')
+    total_stars = cursor.fetchone()[0] or 0
+    
+    bot.reply_to(message, 
+        f"📊 *Статистика бота*\n\n"
+        f"👥 Пользователей: {total_users}\n"
+        f"⭐ Whitelist: {whitelist_count}\n"
+        f"💰 Баланс всего: {total_balance or 0}\n"
+        f"📝 Использовано: {total_used or 0}\n"
+        f"💎 Заработано звезд: {total_stars}",
+        parse_mode='Markdown'
+    )
+
+@bot.message_handler(commands=['img'])
+def generate_image_cmd(message):
+    user_id = message.from_user.id
+    
+    if not has_access(user_id):
+        bot.reply_to(message, "❌ Недостаточно запросов. Купите через /buy")
+        return
+    
+    prompt = message.text.replace('/img', '').strip()
+    if not prompt:
+        bot.reply_to(message, "❌ Напишите описание после /img")
+        return
+    
+    msg = bot.reply_to(message, "🎨 Генерирую изображение...")
+    
+    image_data = ai_image(prompt)
+    
+    if image_data:
+        use_credit(user_id)
+        bot.send_photo(message.chat.id, image_data, caption=f"🎨 {prompt[:100]}")
     else:
-        await update.message.reply_text(response)
+        bot.reply_to(message, "❌ Ошибка генерации")
+    
+    bot.delete_message(message.chat.id, msg.message_id)
 
-async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Ошибка: {context.error}")
+@bot.message_handler(commands=['ask'])
+def ask_ai(message):
+    user_id = message.from_user.id
+    
+    if not has_access(user_id):
+        bot.reply_to(message, "❌ Недостаточно запросов")
+        return
+    
+    question = message.text.replace('/ask', '').strip()
+    if not question:
+        bot.reply_to(message, "❌ Напишите вопрос после /ask")
+        return
+    
+    msg = bot.reply_to(message, "🤔 Думаю...")
+    
+    response = ai_text(question)
+    use_credit(user_id)
+    
+    bot.edit_message_text(f"❓ *Вопрос:* {question}\n\n💡 *Ответ:* {response}", 
+                          message.chat.id, msg.message_id, parse_mode='Markdown')
 
-# ========== ЗАПУСК ==========
+@bot.message_handler(content_types=['text'])
+def handle_text(message):
+    if message.text.startswith('/'):
+        return
+    
+    user_id = message.from_user.id
+    
+    if not has_access(user_id):
+        bot.reply_to(message, "❌ Нет запросов. /buy для покупки")
+        return
+    
+    msg = bot.reply_to(message, "💭 Печатаю...")
+    
+    response = ai_text(message.text)
+    use_credit(user_id)
+    
+    bot.edit_message_text(response, message.chat.id, msg.message_id)
 
-def main():
-    print("🚀 Запуск Ollama Telegram Bot")
-    print("=" * 40)
-    
-    # Инициализируем Ollama
-    if not init_ollama():
-        print("❌ Не удалось инициализировать Ollama")
-        print("Попробуй установить вручную:")
-        print("curl -fsSL https://ollama.com/install.sh | sh")
-        sys.exit(1)
-    
-    print("=" * 40)
-    print(f"✅ Ollama готова!")
-    print(f"🧠 Текущая модель: {MODEL}")
-    print(f"🤖 Запускаю Telegram бота...")
-    
-    # Проверяем ollama-python
-    try:
-        import ollama
-    except ImportError:
-        print("⚠️ Устанавливаю ollama-python...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "ollama"])
-    
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("pull", pull_cmd))
-    app.add_handler(CommandHandler("models", models_cmd))
-    app.add_handler(CommandHandler("switch", switch_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_error_handler(error)
-    
-    print("✅ Бот запущен!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
+# ===== ЗАПУСК =====
 if __name__ == "__main__":
-    main()
+    print("🚀 Бот запущен с бесплатными нейросетями!")
+    print("📝 Текст: Mistral 7B (OpenRouter)")
+    print("🎨 Изображения: Stable Diffusion (Hugging Face)")
+    
+    # Удаляем вебхук и запускаем поллинг
+    bot.remove_webhook()
+    
+    while True:
+        try:
+            bot.polling(none_stop=True, timeout=60)
+        except Exception as e:
+            print(f"❌ Ошибка: {e}")
+            time.sleep(5)
